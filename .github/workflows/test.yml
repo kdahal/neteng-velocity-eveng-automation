@@ -9,7 +9,8 @@ jobs:
   integration-test:
     name: Run Fabric Performance Regression
     runs-on: self-hosted
-    environment: velocity-lab-env   # <--- MUST be right here at job level
+    environment:
+      name: velocity-lab-env
 
     steps:
       - name: Checkout Code
@@ -19,3 +20,9 @@ jobs:
         run: |
           echo "Environment approved and provisioned by Velocity!"
           echo "Executing test payload against allocated topology..."
+
+      - name: Teardown Lab Environment
+        if: always()
+        run: |
+          echo "Workflow finished. Releasing Keysight Velocity reservation..."
+          curl -s -X POST "http://127.0.0.1:8443/teardown/active" || true

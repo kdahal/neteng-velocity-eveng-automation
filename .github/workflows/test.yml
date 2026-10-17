@@ -1,0 +1,21 @@
+name: Network Test Suite
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  integration-test:
+    name: Run Fabric Performance Regression
+    runs-on: self-hosted
+    environment: velocity-lab-env   # <--- MUST be right here at job level
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Execute Network Verification
+        run: |
+          echo "Environment approved and provisioned by Velocity!"
+          echo "Executing test payload against allocated topology..."

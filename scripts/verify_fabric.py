@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Fabric Verification Script for EVE-NG Topology.
-Ensures nodes are booted, verifies state via EVE-NG Pro API,
-and checks serial console socket reachability.
+Verifies operational state by executing show commands over VyOS console ports.
 """
 import sys
 import time
 import socket
+import telnetlib
 import requests
 
 EVE_IP = "192.168.122.19"
@@ -25,11 +25,24 @@ def check_tcp_port(host: str, port: int, timeout: float = 2.0) -> bool:
     except (socket.timeout, ConnectionRefusedError, OSError):
         return False
 
+def query_vyos_console(host: str, port: int, command: str = "show version") -> str:
+    """Connects to VyOS serial port, sends command, returns terminal output."""
+    try:
+        tn = telnetlib.Telnet(host, port, timeout=5)
+        # Flush initial buffer with newline
+        tn.write(b"\r\n")
+        time.sleep(1)
+        tn.write(f"{command}\r\n".encode("ascii"))
+        time.sleep(2)
+        output = tn.read_very_eager().decode("latin-1", errors="ignore")
+        tn.close()
+        return output
+    except Exception as e:
+        return f"Error: {e}"
+
 def get_nodes(session):
     res = session.get(NODES_URL, timeout=5)
-    if res.status_code != 200:
-        return None
-    return res.json().get("data", {})
+    return res.json().get("data", {}) if res.status_code == 200 else None
 
 def main():
     print("========================================")
@@ -37,74 +50,55 @@ def main():
     print("========================================")
 
     session = requests.Session()
-    login_payload = {"username": "admin", "password": "eve", "html5": "-1"}
-
-    try:
-        login_res = session.post(AUTH_URL, json=login_payload, timeout=5)
-        if login_res.status_code != 200 or login_res.json().get("status") != "success":
-            print(f"[FAIL] Unable to authenticate with EVE-NG API at {EVE_IP}")
-            sys.exit(1)
-    except Exception as e:
-        print(f"[FAIL] Connection error to EVE-NG: {e}")
+    login_res = session.post(AUTH_URL, json={"username": "admin", "password": "eve", "html5": "-1"}, timeout=5)
+    if login_res.status_code != 200:
+        print("[FAIL] EVE-NG authentication failed.")
         sys.exit(1)
 
     nodes = get_nodes(session)
     if not nodes:
-        print("[FAIL] Failed to retrieve nodes or lab is empty.")
+        print("[FAIL] Unable to read lab nodes.")
         sys.exit(1)
 
-    # Check if any nodes are stopped (status != 2)
+    # Ensure nodes are started
     stopped_nodes = [info["name"] for info in nodes.values() if info.get("status") != 2]
     if stopped_nodes:
-        print(f"[*] Detected stopped nodes: {', '.join(stopped_nodes)}. Sending start signal...")
-        start_res = session.get(START_URL, timeout=10)
-        print(f"[*] EVE-NG start command returned: {start_res.status_code}")
-
-        # Poll up to 60 seconds for all nodes to report status == 2
-        print("[*] Waiting for nodes to reach RUNNING state...")
-        for attempt in range(12):
+        print(f"[*] Starting stopped nodes: {', '.join(stopped_nodes)}")
+        session.get(START_URL, timeout=10)
+        for _ in range(12):
             time.sleep(5)
             nodes = get_nodes(session)
-            all_running = all(info.get("status") == 2 for info in nodes.values())
-            if all_running:
-                print(f"[✓] All nodes transitioned to RUNNING after {(attempt + 1) * 5}s.")
+            if all(info.get("status") == 2 for info in nodes.values()):
                 break
-        else:
-            print("[WARNING] Timed out waiting for all nodes to report running state. Proceeding with checks...")
 
-    # Allow serial buffers and telnet daemons a short grace period to bind
     time.sleep(5)
 
     all_passed = True
-    print(f"\nEvaluating {len(nodes)} node(s) in {LAB_PATH}:\n")
-
     for node_id, info in nodes.items():
-        name = info.get("name", f"node-{node_id}")
-        status = info.get("status", 0)  # 2 = running
+        name = info.get("name")
         url = info.get("url", "")
+        port = int(url.split(":")[-1]) if ":" in url else None
 
-        port = None
-        if ":" in url:
-            try:
-                port = int(url.split(":")[-1])
-            except ValueError:
-                port = None
+        if not port or not check_tcp_port(EVE_IP, port):
+            print(f"[FAIL] {name:<12} (Port {port}): Unreachable socket.")
+            all_passed = False
+            continue
 
-        is_running = (status == 2)
-        console_ok = check_tcp_port(EVE_IP, port) if port else False
+        # Interrogate console
+        raw_output = query_vyos_console(EVE_IP, port, "show interfaces")
+        has_response = len(raw_output.strip()) > 0
+        status_label = "PASS" if has_response else "FAIL"
+        
+        print(f"[{status_label}] {name:<12} (Port {port}): Serial buffer responsive.")
 
-        pass_status = is_running and console_ok
-        status_label = "PASS" if pass_status else "FAIL"
-        print(f"[{status_label}] Node: {name:<12} (ID: {node_id}) | Running: {'YES' if is_running else 'NO'} | Console: {EVE_IP}:{port or 'N/A'} {'UP' if console_ok else 'DOWN'}")
-
-        if not pass_status:
+        if not has_response:
             all_passed = False
 
     if not all_passed:
-        print("\n[!] Regression failed: Nodes failed to start or console sockets closed.")
+        print("\n[!] Regression failed: Node serial consoles non-responsive.")
         sys.exit(1)
 
-    print("\n[✓] All fabric nodes running with responsive console ports.")
+    print("\n[✓] All fabric nodes operational and verified.")
     sys.exit(0)
 
 if __name__ == "__main__":

@@ -16,10 +16,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Execute Network Verification
+      - name: Run Fabric Connectivity Regression
         run: |
-          echo "Environment approved and provisioned by Velocity!"
-          echo "Executing test payload against allocated topology..."
+          echo "Executing automated network tests against EVE-NG nodes..."
+          /home/kumar/velocity-env/bin/python3 scripts/verify_fabric.py
 
       - name: Teardown Lab Environment
         if: always()

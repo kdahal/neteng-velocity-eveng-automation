@@ -165,21 +165,22 @@ async def handle_velocity_callback(request: Request):
     print(f"[GATE APPROVED] GitHub response {gh_res.status_code} for reservation {reservation_id}")
     return {"status": "gate_approved", "github_status": gh_res.status_code}
 
+EVE_IP = "192.168.122.19"
+LAB_PATH = "Velocity-Integration-Lab/Base-POC-Lab.unl"
+EVE_AUTH_URL = f"http://{EVE_IP}/api/auth/login"
+EVE_STOP_URL = f"http://{EVE_IP}/api/labs/{LAB_PATH}/nodes/stop"
+
 @app.post("/teardown/{reservation_id}")
 async def handle_teardown(reservation_id: str):
-    """Releases Velocity resources by issuing the confirmed query parameter cancel action."""
+    """Releases Velocity resources and stops running EVE-NG nodes."""
     headers = {
         "X-Auth-Token": VELOCITY_TOKEN,
         "Content-Type": "application/json"
     }
-    
-    # Target all tracked reservations if 'active' keyword is passed
-    target_ids = list(active_deployments.keys()) if reservation_id == "active" else [reservation_id]
-    
-    if not target_ids:
-        print("[TEARDOWN] No active reservations in memory to release.")
-        return {"status": "no_active_reservations"}
 
+    target_ids = list(active_deployments.keys()) if reservation_id == "active" else [reservation_id]
+
+    # 1. Release Velocity Reservations
     results = {}
     for res_id in target_ids:
         res = requests.post(
@@ -192,7 +193,17 @@ async def handle_teardown(reservation_id: str):
         print(f"[TEARDOWN] Reservation {res_id} canceled: HTTP {res.status_code}")
         results[res_id] = res.status_code
 
-    return {"status": "released", "results": results}
+    # 2. Stop EVE-NG Lab Nodes
+    try:
+        session = requests.Session()
+        login_res = session.post(EVE_AUTH_URL, json={"username": "admin", "password": "eve", "html5": "-1"}, timeout=5)
+        if login_res.status_code == 200:
+            stop_res = session.get(EVE_STOP_URL, timeout=10)
+            print(f"[TEARDOWN] EVE-NG nodes stop signal sent: HTTP {stop_res.status_code}")
+    except Exception as e:
+        print(f"[TEARDOWN ERROR] Failed to signal EVE-NG stop: {e}")
+
+    return {"status": "released", "velocity_results": results}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8443)

@@ -26,10 +26,8 @@ def check_tcp_port(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 def query_vyos_console(host: str, port: int, command: str = "show version") -> str:
-    """Connects to VyOS serial port, sends command, returns terminal output."""
     try:
         tn = telnetlib.Telnet(host, port, timeout=5)
-        # Flush initial buffer with newline
         tn.write(b"\r\n")
         time.sleep(1)
         tn.write(f"{command}\r\n".encode("ascii"))
@@ -40,9 +38,26 @@ def query_vyos_console(host: str, port: int, command: str = "show version") -> s
     except Exception as e:
         return f"Error: {e}"
 
+def login(session):
+    return session.post(
+        AUTH_URL, 
+        json={"username": "admin", "password": "eve", "html5": "-1"}, 
+        timeout=5
+    )
+
 def get_nodes(session):
-    res = session.get(NODES_URL, timeout=5)
-    return res.json().get("data", {}) if res.status_code == 200 else None
+    try:
+        res = session.get(NODES_URL, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("data", {})
+        elif res.status_code in (401, 412):
+            login(session)
+            retry_res = session.get(NODES_URL, timeout=5)
+            if retry_res.status_code == 200:
+                return retry_res.json().get("data", {})
+    except Exception:
+        pass
+    return None
 
 def main():
     print("========================================")
@@ -50,7 +65,7 @@ def main():
     print("========================================")
 
     session = requests.Session()
-    login_res = session.post(AUTH_URL, json={"username": "admin", "password": "eve", "html5": "-1"}, timeout=5)
+    login_res = login(session)
     if login_res.status_code != 200:
         print("[FAIL] EVE-NG authentication failed.")
         sys.exit(1)
@@ -68,10 +83,16 @@ def main():
         for _ in range(12):
             time.sleep(5)
             nodes = get_nodes(session)
-            if all(info.get("status") == 2 for info in nodes.values()):
+            # Safely check nodes exists and is not None before checking values
+            if nodes and all(info.get("status") == 2 for info in nodes.values()):
                 break
 
     time.sleep(5)
+
+    nodes = get_nodes(session)
+    if not nodes:
+        print("[FAIL] Nodes could not be retrieved after startup loop.")
+        sys.exit(1)
 
     all_passed = True
     for node_id, info in nodes.items():
@@ -84,7 +105,6 @@ def main():
             all_passed = False
             continue
 
-        # Interrogate console
         raw_output = query_vyos_console(EVE_IP, port, "show interfaces")
         has_response = len(raw_output.strip()) > 0
         status_label = "PASS" if has_response else "FAIL"

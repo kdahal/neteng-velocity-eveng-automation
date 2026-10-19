@@ -4,6 +4,16 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      priority:
+        description: "Velocity Reservation Priority"
+        required: true
+        default: "MEDIUM"
+        type: choice
+        options:
+          - "LOW"
+          - "MEDIUM"
+          - "HIGH"
 
 jobs:
   integration-test:
@@ -20,9 +30,3 @@ jobs:
         run: |
           echo "Executing automated network tests against EVE-NG nodes..."
           /home/kumar/velocity-env/bin/python3 scripts/verify_fabric.py
-
-      - name: Teardown Lab Environment
-        if: always()
-        run: |
-          echo "Workflow finished. Releasing Keysight Velocity reservation..."
-          curl -s -X POST "http://127.0.0.1:8443/teardown/active" || true

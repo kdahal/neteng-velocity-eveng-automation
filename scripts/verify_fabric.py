@@ -87,7 +87,7 @@ def main():
             if nodes and all(info.get("status") == 2 for info in nodes.values()):
                 break
 
-    time.sleep(5)
+    time.sleep(10)
 
     nodes = get_nodes(session)
     if not nodes:

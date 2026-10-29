@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<resourceDriver>
+  <!-- Manifest version must be 1.4 -->
+  <manifestVersion>1.4</manifestVersion>
+  <version>1.0.0</version>
+  <vendor>Custom</vendor>
+  <!-- Execution language matching the agent interpreter -->
+  <language>python</language>
+  <!-- Interface type: Orchestration for ephemeral lab/node drivers -->
+  <interface>Orchestration</interface>
+  <!-- Entry point script at the root of the archive -->
+  <entryPoint>rp_eveng_poc.py</entryPoint>
+  <!-- Passes CLI arguments by name (--param value) -->
+  <supportCustomArguments>true</supportCustomArguments>
+
+  <!-- Properties supplied by Velocity templates/reservations -->
+  <resourceProperties>
+    <property optional="true">
+      <name>eve_url</name>
+      <description>EVE-NG Pro REST API base URL</description>
+    </property>
+    <property optional="true">
+      <name>eve_username</name>
+      <description>EVE-NG Pro username</description>
+    </property>
+    <property optional="true">
+      <name>eve_password</name>
+      <description>EVE-NG Pro password</description>
+    </property>
+    <property optional="true">
+      <name>node_template</name>
+      <description>Default node template</description>
+    </property>
+  </resourceProperties>
+</resourceDriver>

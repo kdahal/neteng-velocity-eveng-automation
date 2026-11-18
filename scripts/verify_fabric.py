@@ -145,7 +145,7 @@ def main():
 
     print("\n[✓] All fabric nodes operational and verified.")
     hold_sec = int(os.environ.get("DEMO_HOLD_SECONDS", "45"))
-    if hold_sec > 45:
+    if hold_sec > 0:
         print(f"[*] Holding active sandbox open for {hold_sec}s for live inspection...")
     time.sleep(hold_sec)
     sys.exit(0)

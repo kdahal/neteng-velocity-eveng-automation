@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 Fabric Verification Script for EVE-NG Topology.
-Verifies operational state by executing show commands over VyOS console ports.
+Discovers the active dynamic Vel_POC_*.unl lab (with fallback to Base-POC-Lab.unl)
+and verifies operational state over VyOS serial console ports.
 """
 import sys
 import time
 import socket
 import telnetlib
+import urllib.parse
 import requests
 
 EVE_IP = "192.168.122.19"
-LAB_PATH = "Velocity-Integration-Lab/Base-POC-Lab.unl"
+FALLBACK_LAB_PATH = "Velocity-Integration-Lab/Base-POC-Lab.unl"
 AUTH_URL = f"http://{EVE_IP}/api/auth/login"
-NODES_URL = f"http://{EVE_IP}/api/labs/{LAB_PATH}/nodes"
-START_URL = f"http://{EVE_IP}/api/labs/{LAB_PATH}/nodes/start"
+FOLDERS_URL = f"http://{EVE_IP}/api/folders/"
 
 def check_tcp_port(host: str, port: int, timeout: float = 2.0) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -40,19 +41,38 @@ def query_vyos_console(host: str, port: int, command: str = "show version") -> s
 
 def login(session):
     return session.post(
-        AUTH_URL, 
-        json={"username": "admin", "password": "eve", "html5": "-1"}, 
+        AUTH_URL,
+        json={"username": "admin", "password": "eve", "html5": "-1"},
         timeout=5
     )
 
-def get_nodes(session):
+def discover_active_lab(session) -> str:
+    """Finds the ephemeral Vel_POC_*.unl lab created by EveNgPocDriver."""
     try:
-        res = session.get(NODES_URL, timeout=5)
+        res = session.get(FOLDERS_URL, timeout=5)
+        if res.status_code == 200:
+            labs = res.json().get("data", {}).get("labs", [])
+            poc_labs = [
+                lab.get("path", "").lstrip("/")
+                for lab in labs
+                if lab.get("file", "").startswith("Vel_POC_") and lab.get("file", "").endswith(".unl")
+            ]
+            if poc_labs:
+                return sorted(poc_labs)[-1]
+    except Exception as e:
+        print(f"[WARN] Folder discovery error: {e}")
+    return FALLBACK_LAB_PATH
+
+def get_nodes(session, lab_path: str):
+    encoded_path = urllib.parse.quote(lab_path)
+    nodes_url = f"http://{EVE_IP}/api/labs/{encoded_path}/nodes"
+    try:
+        res = session.get(nodes_url, timeout=5)
         if res.status_code == 200:
             return res.json().get("data", {})
         elif res.status_code in (401, 412):
             login(session)
-            retry_res = session.get(NODES_URL, timeout=5)
+            retry_res = session.get(nodes_url, timeout=5)
             if retry_res.status_code == 200:
                 return retry_res.json().get("data", {})
     except Exception:
@@ -70,26 +90,29 @@ def main():
         print("[FAIL] EVE-NG authentication failed.")
         sys.exit(1)
 
-    nodes = get_nodes(session)
+    lab_path = discover_active_lab(session)
+    print(f"[*] Target Lab: {lab_path}")
+
+    nodes = get_nodes(session, lab_path)
     if not nodes:
-        print("[FAIL] Unable to read lab nodes.")
+        print(f"[FAIL] Unable to read lab nodes from {lab_path}.")
         sys.exit(1)
 
     # Ensure nodes are started
     stopped_nodes = [info["name"] for info in nodes.values() if info.get("status") != 2]
     if stopped_nodes:
         print(f"[*] Starting stopped nodes: {', '.join(stopped_nodes)}")
-        session.get(START_URL, timeout=10)
+        encoded_path = urllib.parse.quote(lab_path)
+        session.get(f"http://{EVE_IP}/api/labs/{encoded_path}/nodes/start", timeout=10)
         for _ in range(12):
             time.sleep(5)
-            nodes = get_nodes(session)
-            # Safely check nodes exists and is not None before checking values
+            nodes = get_nodes(session, lab_path)
             if nodes and all(info.get("status") == 2 for info in nodes.values()):
                 break
 
     time.sleep(5)
 
-    nodes = get_nodes(session)
+    nodes = get_nodes(session, lab_path)
     if not nodes:
         print("[FAIL] Nodes could not be retrieved after startup loop.")
         sys.exit(1)
@@ -108,7 +131,7 @@ def main():
         raw_output = query_vyos_console(EVE_IP, port, "show interfaces")
         has_response = len(raw_output.strip()) > 0
         status_label = "PASS" if has_response else "FAIL"
-        
+
         print(f"[{status_label}] {name:<12} (Port {port}): Serial buffer responsive.")
 
         if not has_response:

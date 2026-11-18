@@ -10,6 +10,8 @@ import socket
 import telnetlib
 import urllib.parse
 import requests
+import os
+import time
 
 EVE_IP = "192.168.122.19"
 FALLBACK_LAB_PATH = "Velocity-Integration-Lab/Base-POC-Lab.unl"
@@ -142,6 +144,10 @@ def main():
         sys.exit(1)
 
     print("\n[✓] All fabric nodes operational and verified.")
+    hold_sec = int(os.environ.get("DEMO_HOLD_SECONDS", "45"))
+    if hold_sec > 0:
+        print(f"[*] Holding active sandbox open for {hold_sec}s for live inspection...")
+    time.sleep(hold_sec)
     sys.exit(0)
 
 if __name__ == "__main__":

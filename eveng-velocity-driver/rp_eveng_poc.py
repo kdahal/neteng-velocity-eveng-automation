@@ -3,8 +3,18 @@ import sys
 import os
 import json
 import time
+import traceback
 import argparse
 import requests
+
+
+def _debug_log(msg):
+    try:
+        with open("/tmp/vel_driver_debug.log", "a") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
 
 class EveNgClient:
     """Minimal wrapper around EVE-NG Pro REST API."""
@@ -30,11 +40,7 @@ class EveNgClient:
 
     def create_lab(self, lab_path, lab_name):
         url = f"{self.base_url}/labs"
-        payload = json.dumps({
-            "path": lab_path,
-            "name": lab_name,
-            "version": "1"
-        })
+        payload = json.dumps({"path": lab_path, "name": lab_name, "version": "1"})
         res = self.session.post(url, data=payload, timeout=15)
         if res.status_code not in (200, 201):
             raise RuntimeError(f"Failed to create lab {lab_name}: {res.text}")
@@ -60,7 +66,8 @@ class EveNgClient:
             "type": "bridge",
             "name": net_name,
             "left": left,
-            "top": top
+            "top": top,
+            "visibility": "1"
         })
         res = self.session.post(url, data=payload, timeout=15)
         data = res.json()
@@ -70,17 +77,19 @@ class EveNgClient:
 
     def connect_interface(self, full_lab_path, node_id, iface_id, network_id):
         url = f"{self.base_url}/labs{full_lab_path}/nodes/{node_id}/interfaces"
-        # In EVE-NG Pro, network_id must be an integer, not a string
-        payload = json.dumps({str(iface_id): int(network_id)})
+        payload = json.dumps({str(iface_id): str(network_id)})
         res = self.session.put(url, data=payload, timeout=15)
         if res.status_code not in (200, 201):
             raise RuntimeError(f"Failed to connect node {node_id} iface {iface_id}: {res.text}")
 
-    def start_node(self, full_lab_path, node_id):
-        url = f"{self.base_url}/labs{full_lab_path}/nodes/{node_id}/start"
-        res = self.session.get(url, timeout=30)
-        if res.status_code not in (200, 201):
-            raise RuntimeError(f"Failed to start node {node_id}: {res.text}")
+    def start_all_nodes(self, full_lab_path):
+        url = f"{self.base_url}/labs{full_lab_path}/nodes/start"
+        for attempt in range(3):
+            res = self.session.get(url, timeout=30)
+            if res.status_code in (200, 201):
+                return
+            time.sleep(2)
+        raise RuntimeError(f"Failed to start lab nodes ({res.status_code}): {res.text}")
 
     def stop_all_nodes(self, full_lab_path):
         url = f"{self.base_url}/labs{full_lab_path}/nodes/stop"
@@ -95,11 +104,16 @@ class EveNgClient:
         return res.status_code in (200, 204)
 
 
+def _resolve_lab_name(args):
+    res_id = (
+        args.reservation_id
+        or os.environ.get("VELOCITY_PARAM_reservationId")
+        or str(int(time.time() * 1000))
+    ).strip()
+    return f"Vel_POC_{res_id}"
+
+
 def cmd_get_ports(args):
-    """
-    Returns discovery port definitions to Velocity Core.
-    Per Velocity Portfolio Driver Reference Guide (p. 10), status must be 'online'.
-    """
     ports = [
         {"name": "eth1", "status": "online", "properties": {"ipAddress": "192.168.122.19"}},
         {"name": "eth2", "status": "online", "properties": {"ipAddress": "192.168.122.19"}}
@@ -108,11 +122,24 @@ def cmd_get_ports(args):
     sys.exit(0)
 
 
-def cmd_init_resource(args):
-    """Instantiates dynamic lab, 2 nodes, 1 interconnect link, then boots nodes."""
-    res_id = args.reservation_id or os.environ.get("VELOCITY_PARAM_reservationId", "poc_res")
-    lab_name = f"Vel_POC_{res_id}"
+def cmd_get_properties(args):
+    sys.stdout.write(json.dumps({
+        "properties": {
+            "manufacturerName": "EVE-NG",
+            "modelName": "EVE-NG-Pro-Dynamic"
+        }
+    }))
+    sys.exit(0)
+
+
+def cmd_init_resource(args, action_name):
+    lab_name = _resolve_lab_name(args)
     lab_full_path = f"/{lab_name}.unl"
+    try:
+        with open("/tmp/vel_active_lab.txt", "w") as sf:
+            sf.write(lab_full_path)
+    except Exception as e:
+        _debug_log(f"Warning writing state file: {e}")
 
     eve_url = args.eve_url or os.environ.get("VELOCITY_PARAM_property_eve_url", "http://192.168.122.19/api")
     eve_username = args.eve_username or os.environ.get("VELOCITY_PARAM_property_eve_username", "admin")
@@ -122,57 +149,61 @@ def cmd_init_resource(args):
     client = EveNgClient(eve_url, eve_username, eve_password)
     try:
         client.login()
-        # Clean up any stale lab with the same name if exists
-        try:
-            client.delete_lab(lab_full_path)
-        except Exception:
-            pass
-
         client.create_lab("/", lab_name)
-
-        # 1. Create bridge network
         net_id = client.add_bridge_network(lab_full_path, "P2P_Link", left=400, top=200)
-
-        # 2. Instantiate 2 nodes
         n1_id = client.add_node(lab_full_path, node_template, "V-VyOS-01", left=200, top=200)
         n2_id = client.add_node(lab_full_path, node_template, "V-VyOS-02", left=600, top=200)
-
         time.sleep(1)
 
-        # 3. Wire both eth0 (index 0) to P2P_Link using integer net_id
         client.connect_interface(lab_full_path, n1_id, iface_id=0, network_id=net_id)
         client.connect_interface(lab_full_path, n2_id, iface_id=0, network_id=net_id)
 
-        # 4. Boot both nodes
-        client.start_node(lab_full_path, n1_id)
-        client.start_node(lab_full_path, n2_id)
+        time.sleep(1)
+        client.start_all_nodes(lab_full_path)
 
-        response = {
-            "status": "SUCCESS",
-            "message": f"Orchestrated lab '{lab_name}' provisioned and powered on.",
-            "data": {
-                "lab_path": lab_full_path,
-                "node_1_id": n1_id,
-                "node_2_id": n2_id,
-                "network_id": net_id
+        if action_name == "initVelocitySelected":
+            response = {
+                "reservationProperties": {
+                    "eve_lab_path": lab_full_path,
+                    "node_1_id": str(n1_id),
+                    "node_2_id": str(n2_id),
+                    "network_id": str(net_id)
+                }
             }
-        }
+        else:
+            response = {
+                "properties": {
+                    "eve_lab_path": lab_full_path,
+                    "node_1_id": str(n1_id),
+                    "node_2_id": str(n2_id),
+                    "network_id": str(net_id)
+                },
+                "ports": [],
+                "switchPorts": [],
+                "connections": [],
+                "reservationProperties": {
+                    "eve_lab_path": lab_full_path
+                }
+            }
+
+        _debug_log(f"SUCCESS init {lab_full_path}")
         sys.stdout.write(json.dumps(response))
         sys.exit(0)
 
     except Exception as exc:
-        err = {"status": "FAILED", "error": str(exc)}
-        sys.stderr.write(json.dumps(err))
+        _debug_log(f"ERROR init {lab_full_path}: {exc}\n{traceback.format_exc()}")
+        sys.stderr.write(str(exc))
         sys.exit(1)
     finally:
         client.logout()
 
 
 def cmd_term_resource(args):
-    """Stops running nodes and destroys the ephemeral lab."""
-    res_id = args.reservation_id or os.environ.get("VELOCITY_PARAM_reservationId", "poc_res")
-    lab_name = f"Vel_POC_{res_id}"
-    lab_full_path = f"/{lab_name}.unl"
+    if os.path.exists("/tmp/vel_active_lab.txt"):
+        with open("/tmp/vel_active_lab.txt") as sf:
+            lab_full_path = sf.read().strip()
+    else:
+        lab_full_path = f"/{_resolve_lab_name(args)}.unl"
 
     eve_url = args.eve_url or os.environ.get("VELOCITY_PARAM_property_eve_url", "http://192.168.122.19/api")
     eve_username = args.eve_username or os.environ.get("VELOCITY_PARAM_property_eve_username", "admin")
@@ -184,17 +215,12 @@ def cmd_term_resource(args):
         client.stop_all_nodes(lab_full_path)
         time.sleep(1)
         client.delete_lab(lab_full_path)
-
-        response = {
-            "status": "SUCCESS",
-            "message": f"Lab '{lab_name}' successfully terminated and purged."
-        }
-        sys.stdout.write(json.dumps(response))
+        _debug_log(f"SUCCESS term {lab_full_path}")
+        sys.stdout.write(json.dumps({}))
         sys.exit(0)
-
     except Exception as exc:
-        err = {"status": "FAILED", "error": str(exc)}
-        sys.stderr.write(json.dumps(err))
+        _debug_log(f"ERROR term {lab_full_path}: {exc}\n{traceback.format_exc()}")
+        sys.stderr.write(str(exc))
         sys.exit(1)
     finally:
         client.logout()
@@ -202,23 +228,30 @@ def cmd_term_resource(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Velocity EVE-NG Pro Orchestration Driver")
-    parser.add_argument("action", nargs="?", default="initOrchestratedResource",
-                        choices=["getPorts", "initOrchestratedResource", "termOrchestratedResource"])
+    parser.add_argument("action", nargs="?", default=None)
     parser.add_argument("--eve_url", "-eve_url", default=None)
     parser.add_argument("--eve_username", "-eve_username", default=None)
     parser.add_argument("--eve_password", "-eve_password", default=None)
     parser.add_argument("--node_template", "-node_template", default=None)
     parser.add_argument("--reservation_id", "-reservation_id", default=None)
 
-    # Use parse_known_args to be resilient to extra Velocity flags
     parsed_args, _ = parser.parse_known_args()
 
-    if parsed_args.action == "getPorts":
+    env_call = os.environ.get("VELOCITY_PARAM_call_0", "").strip()
+    env_action = env_call.split()[0] if env_call else ""
+    action = (parsed_args.action or env_action or "initVelocitySelected").strip()
+
+    if action == "getPorts":
         cmd_get_ports(parsed_args)
-    elif parsed_args.action == "initOrchestratedResource":
-        cmd_init_resource(parsed_args)
-    elif parsed_args.action == "termOrchestratedResource":
+    elif action == "getProperties":
+        cmd_get_properties(parsed_args)
+    elif action in ("initOrchestratedResource", "initVelocitySelected"):
+        cmd_init_resource(parsed_args, action)
+    elif action in ("termOrchestratedResource", "termVelocitySelected"):
         cmd_term_resource(parsed_args)
+    else:
+        sys.stdout.write(json.dumps({}))
+        sys.exit(0)
 
 
 if __name__ == "__main__":

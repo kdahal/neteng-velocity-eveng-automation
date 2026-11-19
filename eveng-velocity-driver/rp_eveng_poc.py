@@ -8,6 +8,22 @@ import argparse
 import requests
 
 
+STARTUP_CONFIGS = {
+    "V-VyOS-01": """set system host-name V-VyOS-01
+set interfaces dummy dum0 address 10.255.0.1/32
+set interfaces ethernet eth0 address 192.168.100.1/24
+commit
+save
+""",
+    "V-VyOS-02": """set system host-name V-VyOS-02
+set interfaces dummy dum0 address 10.255.0.2/32
+set interfaces ethernet eth0 address 192.168.100.2/24
+commit
+save
+"""
+}
+
+
 def _debug_log(msg):
     try:
         with open("/tmp/vel_driver_debug.log", "a") as f:
@@ -59,6 +75,17 @@ class EveNgClient:
         if res.status_code not in (200, 201) or data.get("status") != "success":
             raise RuntimeError(f"Failed to add node {node_name}: {res.text}")
         return data["data"]["id"]
+
+    def set_startup_config(self, full_lab_path, node_id, config_text):
+        cfg_url = f"{self.base_url}/labs{full_lab_path}/configs/{node_id}"
+        res_cfg = self.session.put(cfg_url, data=json.dumps({"data": config_text}), timeout=25)
+        if res_cfg.status_code not in (200, 201):
+            raise RuntimeError(f"Failed to upload config for node {node_id}: {res_cfg.text}")
+
+        node_url = f"{self.base_url}/labs{full_lab_path}/nodes/{node_id}"
+        res_node = self.session.put(node_url, data=json.dumps({"config": "1"}), timeout=25)
+        if res_node.status_code not in (200, 201):
+            raise RuntimeError(f"Failed to enable startup config on node {node_id}: {res_node.text}")
 
     def add_bridge_network(self, full_lab_path, net_name, left=400, top=200):
         url = f"{self.base_url}/labs{full_lab_path}/networks"
@@ -155,6 +182,10 @@ def cmd_init_resource(args, action_name):
         n2_id = client.add_node(lab_full_path, node_template, "V-VyOS-02", left=600, top=200)
         time.sleep(1)
 
+        # Inject startup configs BEFORE first boot (avoids mid-boot stop/lock timeouts)
+        client.set_startup_config(lab_full_path, n1_id, STARTUP_CONFIGS["V-VyOS-01"])
+        client.set_startup_config(lab_full_path, n2_id, STARTUP_CONFIGS["V-VyOS-02"])
+
         client.connect_interface(lab_full_path, n1_id, iface_id=0, network_id=net_id)
         client.connect_interface(lab_full_path, n2_id, iface_id=0, network_id=net_id)
 
@@ -186,7 +217,7 @@ def cmd_init_resource(args, action_name):
                 }
             }
 
-        _debug_log(f"SUCCESS init {lab_full_path}")
+        _debug_log(f"SUCCESS init with configs {lab_full_path}")
         sys.stdout.write(json.dumps(response))
         sys.exit(0)
 

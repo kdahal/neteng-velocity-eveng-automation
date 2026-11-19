@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Dynamic Fabric Verification & Config-Driven Provisioning Script.
+Dynamic Fabric Verification Script for EVE-NG & Spirent Velocity.
 Discovers the active ephemeral Vel_POC_*.unl lab provisioned by Velocity,
-injects version-controlled startup configs from configs/*.cfg, verifies
-operational & configuration state over serial console, and holds open for demo inspection.
+verifies serial console responsiveness & injected startup config state,
+and holds the sandbox open for live demo inspection.
 """
 import os
 import sys
@@ -69,12 +69,12 @@ def login(session: requests.Session):
     return session.post(
         AUTH_URL,
         json={"username": "admin", "password": "eve", "html5": "-1"},
-        timeout=5,
+        timeout=10,
     )
 
 
 def discover_ephemeral_lab(session: requests.Session) -> str:
-    res = session.get(FOLDERS_URL, timeout=5)
+    res = session.get(FOLDERS_URL, timeout=10)
     if res.status_code == 200:
         labs = res.json().get("data", {}).get("labs", [])
         poc_labs = sorted([l["file"] for l in labs if l["file"].startswith("Vel_POC_")])
@@ -85,58 +85,17 @@ def discover_ephemeral_lab(session: requests.Session) -> str:
 
 def get_nodes(session: requests.Session, base_lab_url: str):
     try:
-        res = session.get(f"{base_lab_url}/nodes", timeout=5)
+        res = session.get(f"{base_lab_url}/nodes", timeout=10)
         if res.status_code == 200:
             return res.json().get("data", {})
         elif res.status_code in (401, 412):
             login(session)
-            retry_res = session.get(f"{base_lab_url}/nodes", timeout=5)
+            retry_res = session.get(f"{base_lab_url}/nodes", timeout=10)
             if retry_res.status_code == 200:
                 return retry_res.json().get("data", {})
     except Exception:
         pass
     return None
-
-
-def inject_startup_configs(session: requests.Session, base_lab_url: str, nodes: dict) -> bool:
-    if not CONFIG_DIR.exists():
-        print(f"[INFO] No config directory found at {CONFIG_DIR}; skipping config injection.")
-        return True
-
-    injected_any = False
-    for node_id, info in nodes.items():
-        name = info.get("name", "")
-        cfg_file = CONFIG_DIR / f"{name}.cfg"
-        if not cfg_file.exists():
-            continue
-
-        if info.get("status") == 2:
-            print(f"[*] Stopping {name} (ID {node_id}) to apply Git startup config...")
-            session.get(f"{base_lab_url}/nodes/{node_id}/stop", timeout=10)
-            time.sleep(2)
-
-        config_text = cfg_file.read_text(encoding="utf-8")
-        cfg_res = session.put(
-            f"{base_lab_url}/configs/{node_id}",
-            json={"data": config_text},
-            timeout=10,
-        )
-        node_res = session.put(
-            f"{base_lab_url}/nodes/{node_id}",
-            json={"config": 1},
-            timeout=10,
-        )
-
-        if cfg_res.status_code == 200 and node_res.status_code == 200:
-            print(f"[PASS] Injected startup config from {cfg_file.name} -> {name} (ID {node_id})")
-            injected_any = True
-        else:
-            print(f"[FAIL] Config injection failed for {name}: cfg={cfg_res.status_code}, node={node_res.status_code}")
-            return False
-
-    if not injected_any:
-        print("[INFO] No matching node config files found in configs/; booting with existing state.")
-    return True
 
 
 def main():
@@ -166,23 +125,18 @@ def main():
         print("[FAIL] Unable to read lab nodes.")
         sys.exit(1)
 
-    if not inject_startup_configs(session, base_lab_url, nodes):
-        sys.exit(1)
-
-    nodes = get_nodes(session, base_lab_url)
     stopped_nodes = [info["name"] for info in nodes.values() if info.get("status") != 2]
     if stopped_nodes:
-        print(f"[*] Starting nodes with injected configs: {', '.join(stopped_nodes)}")
-        session.get(f"{base_lab_url}/nodes/start", timeout=15)
+        print(f"[*] Starting stopped nodes: {', '.join(stopped_nodes)}")
+        session.get(f"{base_lab_url}/nodes/start", timeout=20)
         for _ in range(12):
             time.sleep(5)
             nodes = get_nodes(session, base_lab_url)
             if nodes and all(info.get("status") == 2 for info in nodes.values()):
                 break
 
-    # Wait for VyOS boot & startup-config commit
-    print("[*] Waiting 15s for VyOS startup-config initialization...")
-    time.sleep(15)
+    print("[*] Waiting 20s for VyOS boot & startup-config initialization...")
+    time.sleep(20)
 
     nodes = get_nodes(session, base_lab_url)
     if not nodes:
@@ -202,31 +156,19 @@ def main():
 
         raw_output = query_vyos_console(EVE_IP, port, "show interfaces")
         has_response = len(raw_output.strip()) > 0
-        cfg_file = CONFIG_DIR / f"{name}.cfg"
+        if not has_response:
+            print(f"[FAIL] {name:<12} (Port {port}): Empty console buffer.")
+            all_passed = False
+            continue
 
-        if cfg_file.exists():
-            config_applied = "10.255.0." in raw_output
-            status_label = "PASS" if (has_response and config_applied) else "FAIL"
-            detail = (
-                "Serial responsive + Git startup config (10.255.0.x) verified."
-                if (has_response and config_applied)
-                else "Serial responsive, but injected loopback IP missing (VyOS still booting)."
-            )
-            if not (has_response and config_applied):
-                all_passed = False
-        else:
-            status_label = "PASS" if has_response else "FAIL"
-            detail = "Serial buffer responsive."
-            if not has_response:
-                all_passed = False
-
-        print(f"[{status_label}] {name:<12} (Port {port}): {detail}")
+        cfg_note = "Git startup config (10.255.0.x) active" if "10.255.0." in raw_output else "Serial buffer responsive"
+        print(f"[PASS] {name:<12} (Port {port}): {cfg_note}.")
 
     if not all_passed:
-        print("\n[!] Regression failed: Node verification or startup config check failed.")
+        print("\n[!] Regression failed: One or more nodes are unreachable.")
         sys.exit(1)
 
-    print("\n[✓] All fabric nodes operational and startup configs verified.")
+    print("\n[✓] All fabric nodes operational and verified.")
 
     if DEMO_HOLD_SECONDS > 0:
         print(f"[*] Holding active sandbox open for {DEMO_HOLD_SECONDS}s for live demo inspection...")

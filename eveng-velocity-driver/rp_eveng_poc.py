@@ -9,18 +9,29 @@ import requests
 
 
 STARTUP_CONFIGS = {
-    "V-VyOS-01": """set system host-name V-VyOS-01
+    "V-VyOS-Core": """set system host-name V-VyOS-Core
 set interfaces dummy dum0 address 10.255.0.1/32
-set interfaces ethernet eth0 address 192.168.100.1/24
+set interfaces ethernet eth0 address 10.10.1.1/30
+set interfaces ethernet eth1 address 10.10.2.1/30
 commit
 save
 """,
-    "V-VyOS-02": """set system host-name V-VyOS-02
+    "V-VyOS-Edge1": """set system host-name V-VyOS-Edge1
 set interfaces dummy dum0 address 10.255.0.2/32
-set interfaces ethernet eth0 address 192.168.100.2/24
+set interfaces ethernet eth0 address 10.10.1.2/30
+set interfaces ethernet eth1 address 192.168.10.1/24
 commit
 save
-"""
+""",
+    "V-VyOS-Edge2": """set system host-name V-VyOS-Edge2
+set interfaces dummy dum0 address 10.255.0.3/32
+set interfaces ethernet eth0 address 10.10.2.2/30
+set interfaces ethernet eth1 address 192.168.20.1/24
+commit
+save
+""",
+    "V-PC-01": "ip 192.168.10.2/24 192.168.10.1\nsave\n",
+    "V-PC-02": "ip 192.168.20.2/24 192.168.20.1\nsave\n"
 }
 
 
@@ -33,7 +44,7 @@ def _debug_log(msg):
 
 
 class EveNgClient:
-    """Minimal wrapper around EVE-NG Pro REST API."""
+    """Wrapper around EVE-NG Pro REST API supporting multi-node QEMU & VPCS topologies."""
     def __init__(self, base_url, username, password):
         self.base_url = base_url.rstrip("/")
         self.username = username
@@ -61,16 +72,18 @@ class EveNgClient:
         if res.status_code not in (200, 201):
             raise RuntimeError(f"Failed to create lab {lab_name}: {res.text}")
 
-    def add_node(self, full_lab_path, template, node_name, left=200, top=200):
+    def add_node(self, full_lab_path, node_type, template, node_name, left=200, top=200):
         url = f"{self.base_url}/labs{full_lab_path}/nodes"
-        payload = json.dumps({
-            "type": "qemu",
+        body = {
+            "type": node_type,
             "template": template,
             "name": node_name,
             "left": left,
             "top": top
-        })
-        res = self.session.post(url, data=payload, timeout=20)
+        }
+        if node_type == "qemu":
+            body["ethernet"] = 2
+        res = self.session.post(url, data=json.dumps(body), timeout=20)
         data = res.json()
         if res.status_code not in (200, 201) or data.get("status") != "success":
             raise RuntimeError(f"Failed to add node {node_name}: {res.text}")
@@ -99,7 +112,7 @@ class EveNgClient:
         res = self.session.post(url, data=payload, timeout=15)
         data = res.json()
         if res.status_code not in (200, 201) or data.get("status") != "success":
-            raise RuntimeError(f"Failed to add bridge network: {res.text}")
+            raise RuntimeError(f"Failed to add bridge network {net_name}: {res.text}")
         return int(data["data"]["id"])
 
     def connect_interface(self, full_lab_path, node_id, iface_id, network_id):
@@ -177,17 +190,41 @@ def cmd_init_resource(args, action_name):
     try:
         client.login()
         client.create_lab("/", lab_name)
-        net_id = client.add_bridge_network(lab_full_path, "P2P_Link", left=400, top=200)
-        n1_id = client.add_node(lab_full_path, node_template, "V-VyOS-01", left=200, top=200)
-        n2_id = client.add_node(lab_full_path, node_template, "V-VyOS-02", left=600, top=200)
+
+        # 1. Create 4 bridge networks for the hub-and-spoke spider web
+        net_core1 = client.add_bridge_network(lab_full_path, "Link_Core1", left=325, top=220)
+        net_core2 = client.add_bridge_network(lab_full_path, "Link_Core2", left=575, top=220)
+        net_pc1 = client.add_bridge_network(lab_full_path, "Link_PC1", left=200, top=140)
+        net_pc2 = client.add_bridge_network(lab_full_path, "Link_PC2", left=700, top=140)
+
+        # 2. Instantiate 3 VyOS routers + 2 VPCS client endpoints
+        core_id = client.add_node(lab_full_path, "qemu", node_template, "V-VyOS-Core", left=450, top=280)
+        edge1_id = client.add_node(lab_full_path, "qemu", node_template, "V-VyOS-Edge1", left=250, top=180)
+        edge2_id = client.add_node(lab_full_path, "qemu", node_template, "V-VyOS-Edge2", left=650, top=180)
+        pc1_id = client.add_node(lab_full_path, "vpcs", "vpcs", "V-PC-01", left=120, top=80)
+        pc2_id = client.add_node(lab_full_path, "vpcs", "vpcs", "V-PC-02", left=780, top=80)
         time.sleep(1)
 
-        # Inject startup configs BEFORE first boot (avoids mid-boot stop/lock timeouts)
-        client.set_startup_config(lab_full_path, n1_id, STARTUP_CONFIGS["V-VyOS-01"])
-        client.set_startup_config(lab_full_path, n2_id, STARTUP_CONFIGS["V-VyOS-02"])
+        # 3. Inject startup configs before first boot
+        client.set_startup_config(lab_full_path, core_id, STARTUP_CONFIGS["V-VyOS-Core"])
+        client.set_startup_config(lab_full_path, edge1_id, STARTUP_CONFIGS["V-VyOS-Edge1"])
+        client.set_startup_config(lab_full_path, edge2_id, STARTUP_CONFIGS["V-VyOS-Edge2"])
+        client.set_startup_config(lab_full_path, pc1_id, STARTUP_CONFIGS["V-PC-01"])
+        client.set_startup_config(lab_full_path, pc2_id, STARTUP_CONFIGS["V-PC-02"])
 
-        client.connect_interface(lab_full_path, n1_id, iface_id=0, network_id=net_id)
-        client.connect_interface(lab_full_path, n2_id, iface_id=0, network_id=net_id)
+        # 4. Wire the spider-web links
+        # Core <-> Edge1
+        client.connect_interface(lab_full_path, core_id, iface_id=0, network_id=net_core1)
+        client.connect_interface(lab_full_path, edge1_id, iface_id=0, network_id=net_core1)
+        # Core <-> Edge2
+        client.connect_interface(lab_full_path, core_id, iface_id=1, network_id=net_core2)
+        client.connect_interface(lab_full_path, edge2_id, iface_id=0, network_id=net_core2)
+        # Edge1 <-> V-PC-01
+        client.connect_interface(lab_full_path, edge1_id, iface_id=1, network_id=net_pc1)
+        client.connect_interface(lab_full_path, pc1_id, iface_id=0, network_id=net_pc1)
+        # Edge2 <-> V-PC-02
+        client.connect_interface(lab_full_path, edge2_id, iface_id=1, network_id=net_pc2)
+        client.connect_interface(lab_full_path, pc2_id, iface_id=0, network_id=net_pc2)
 
         time.sleep(1)
         client.start_all_nodes(lab_full_path)
@@ -196,18 +233,14 @@ def cmd_init_resource(args, action_name):
             response = {
                 "reservationProperties": {
                     "eve_lab_path": lab_full_path,
-                    "node_1_id": str(n1_id),
-                    "node_2_id": str(n2_id),
-                    "network_id": str(net_id)
+                    "node_count": "5"
                 }
             }
         else:
             response = {
                 "properties": {
                     "eve_lab_path": lab_full_path,
-                    "node_1_id": str(n1_id),
-                    "node_2_id": str(n2_id),
-                    "network_id": str(net_id)
+                    "node_count": "5"
                 },
                 "ports": [],
                 "switchPorts": [],
@@ -217,7 +250,7 @@ def cmd_init_resource(args, action_name):
                 }
             }
 
-        _debug_log(f"SUCCESS init with configs {lab_full_path}")
+        _debug_log(f"SUCCESS init 5-node spider-web {lab_full_path}")
         sys.stdout.write(json.dumps(response))
         sys.exit(0)
 

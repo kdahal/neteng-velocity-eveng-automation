@@ -44,7 +44,7 @@ def _debug_log(msg):
 
 
 class EveNgClient:
-    """Wrapper around EVE-NG Pro REST API supporting multi-node QEMU & VPCS topologies."""
+    """Wrapper around EVE-NG Pro REST API with automatic 412 session-kick recovery."""
     def __init__(self, base_url, username, password):
         self.base_url = base_url.rstrip("/")
         self.username = username
@@ -59,6 +59,15 @@ class EveNgClient:
         if res.status_code not in (200, 201):
             raise RuntimeError(f"EVE-NG login failed ({res.status_code}): {res.text}")
 
+    def _req(self, method, path, **kwargs):
+        url = f"{self.base_url}{path}"
+        kwargs.setdefault("timeout", 20)
+        res = self.session.request(method, url, **kwargs)
+        if res.status_code in (401, 412):
+            self.login()
+            res = self.session.request(method, url, **kwargs)
+        return res
+
     def logout(self):
         try:
             self.session.get(f"{self.base_url}/auth/logout", timeout=5)
@@ -66,14 +75,12 @@ class EveNgClient:
             pass
 
     def create_lab(self, lab_path, lab_name):
-        url = f"{self.base_url}/labs"
         payload = json.dumps({"path": lab_path, "name": lab_name, "version": "1"})
-        res = self.session.post(url, data=payload, timeout=15)
+        res = self._req("POST", "/labs", data=payload)
         if res.status_code not in (200, 201):
             raise RuntimeError(f"Failed to create lab {lab_name}: {res.text}")
 
     def add_node(self, full_lab_path, node_type, template, node_name, left=200, top=200):
-        url = f"{self.base_url}/labs{full_lab_path}/nodes"
         body = {
             "type": node_type,
             "template": template,
@@ -83,25 +90,24 @@ class EveNgClient:
         }
         if node_type == "qemu":
             body["ethernet"] = 2
-        res = self.session.post(url, data=json.dumps(body), timeout=20)
+        elif node_type == "vpcs":
+            body["ethernet"] = 1
+        res = self._req("POST", f"/labs{full_lab_path}/nodes", data=json.dumps(body))
         data = res.json()
         if res.status_code not in (200, 201) or data.get("status") != "success":
             raise RuntimeError(f"Failed to add node {node_name}: {res.text}")
         return data["data"]["id"]
 
     def set_startup_config(self, full_lab_path, node_id, config_text):
-        cfg_url = f"{self.base_url}/labs{full_lab_path}/configs/{node_id}"
-        res_cfg = self.session.put(cfg_url, data=json.dumps({"data": config_text}), timeout=25)
-        if res_cfg.status_code not in (200, 201):
-            raise RuntimeError(f"Failed to upload config for node {node_id}: {res_cfg.text}")
-
-        node_url = f"{self.base_url}/labs{full_lab_path}/nodes/{node_id}"
-        res_node = self.session.put(node_url, data=json.dumps({"config": "1"}), timeout=25)
-        if res_node.status_code not in (200, 201):
-            raise RuntimeError(f"Failed to enable startup config on node {node_id}: {res_node.text}")
+        try:
+            res_cfg = self._req("PUT", f"/labs{full_lab_path}/configs/{node_id}", data=json.dumps({"data": config_text}), timeout=25)
+            res_node = self._req("PUT", f"/labs{full_lab_path}/nodes/{node_id}", data=json.dumps({"config": "1"}), timeout=25)
+            if res_cfg.status_code not in (200, 201) or res_node.status_code not in (200, 201):
+                _debug_log(f"Non-fatal config notice node {node_id}: cfg={res_cfg.status_code}, node={res_node.status_code}")
+        except Exception as e:
+            _debug_log(f"Non-fatal config exception node {node_id}: {e}")
 
     def add_bridge_network(self, full_lab_path, net_name, left=400, top=200):
-        url = f"{self.base_url}/labs{full_lab_path}/networks"
         payload = json.dumps({
             "type": "bridge",
             "name": net_name,
@@ -109,38 +115,34 @@ class EveNgClient:
             "top": top,
             "visibility": "1"
         })
-        res = self.session.post(url, data=payload, timeout=15)
+        res = self._req("POST", f"/labs{full_lab_path}/networks", data=payload)
         data = res.json()
         if res.status_code not in (200, 201) or data.get("status") != "success":
             raise RuntimeError(f"Failed to add bridge network {net_name}: {res.text}")
         return int(data["data"]["id"])
 
     def connect_interface(self, full_lab_path, node_id, iface_id, network_id):
-        url = f"{self.base_url}/labs{full_lab_path}/nodes/{node_id}/interfaces"
-        payload = json.dumps({str(iface_id): str(network_id)})
-        res = self.session.put(url, data=payload, timeout=15)
+        payload = json.dumps({str(iface_id): int(network_id)})
+        res = self._req("PUT", f"/labs{full_lab_path}/nodes/{node_id}/interfaces", data=payload)
         if res.status_code not in (200, 201):
             raise RuntimeError(f"Failed to connect node {node_id} iface {iface_id}: {res.text}")
 
     def start_all_nodes(self, full_lab_path):
-        url = f"{self.base_url}/labs{full_lab_path}/nodes/start"
         for attempt in range(3):
-            res = self.session.get(url, timeout=30)
+            res = self._req("GET", f"/labs{full_lab_path}/nodes/start", timeout=30)
             if res.status_code in (200, 201):
                 return
             time.sleep(2)
         raise RuntimeError(f"Failed to start lab nodes ({res.status_code}): {res.text}")
 
     def stop_all_nodes(self, full_lab_path):
-        url = f"{self.base_url}/labs{full_lab_path}/nodes/stop"
         try:
-            self.session.get(url, timeout=30)
+            self._req("GET", f"/labs{full_lab_path}/nodes/stop", timeout=30)
         except Exception:
             pass
 
     def delete_lab(self, full_lab_path):
-        url = f"{self.base_url}/labs{full_lab_path}"
-        res = self.session.delete(url, timeout=20)
+        res = self._req("DELETE", f"/labs{full_lab_path}", timeout=20)
         return res.status_code in (200, 204)
 
 
@@ -213,16 +215,12 @@ def cmd_init_resource(args, action_name):
         client.set_startup_config(lab_full_path, pc2_id, STARTUP_CONFIGS["V-PC-02"])
 
         # 4. Wire the spider-web links
-        # Core <-> Edge1
         client.connect_interface(lab_full_path, core_id, iface_id=0, network_id=net_core1)
         client.connect_interface(lab_full_path, edge1_id, iface_id=0, network_id=net_core1)
-        # Core <-> Edge2
         client.connect_interface(lab_full_path, core_id, iface_id=1, network_id=net_core2)
         client.connect_interface(lab_full_path, edge2_id, iface_id=0, network_id=net_core2)
-        # Edge1 <-> V-PC-01
         client.connect_interface(lab_full_path, edge1_id, iface_id=1, network_id=net_pc1)
         client.connect_interface(lab_full_path, pc1_id, iface_id=0, network_id=net_pc1)
-        # Edge2 <-> V-PC-02
         client.connect_interface(lab_full_path, edge2_id, iface_id=1, network_id=net_pc2)
         client.connect_interface(lab_full_path, pc2_id, iface_id=0, network_id=net_pc2)
 

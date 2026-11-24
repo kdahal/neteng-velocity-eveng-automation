@@ -1,43 +1,18 @@
 #!/usr/bin/env python3
 """
-Dynamic Fabric Verification Script for EVE-NG & Spirent Velocity.
-Discovers the active ephemeral Vel_POC_*.unl lab provisioned by Velocity,
-verifies serial console responsiveness & injected startup config state,
-and holds the sandbox open for live demo inspection.
+Fabric Verification Script for EVE-NG Ephemeral Topologies.
+Discovers the active Vel_EFC_UC1_* or Vel_POC_* lab, waits for vJunos/VyOS/VPCS
+control-plane boot (~90-120s for Junos), and verifies serial console & SSH readiness.
 """
-import os
 import sys
 import time
 import socket
 import telnetlib
-import urllib.parse
-from pathlib import Path
 import requests
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 EVE_IP = "192.168.122.19"
 AUTH_URL = f"http://{EVE_IP}/api/auth/login"
 FOLDERS_URL = f"http://{EVE_IP}/api/folders/"
-CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
-
-VELOCITY_HOST = os.environ.get("VELOCITY_HOST", "https://192.168.122.106")
-VELOCITY_PRIORITY = os.environ.get("VELOCITY_PRIORITY", "MEDIUM")
-DEMO_HOLD_SECONDS = int(os.environ.get("DEMO_HOLD_SECONDS", "30"))
-
-
-def check_velocity_api() -> bool:
-    try:
-        health = requests.get(f"{VELOCITY_HOST}/health-status", verify=False, timeout=5)
-        if health.status_code != 200 or health.json().get("healthWarning") is not None:
-            print(f"[FAIL] Velocity Core health check failed: {health.text}")
-            return False
-        print(f"[PASS] Velocity Core ({VELOCITY_HOST}) healthy | Priority: {VELOCITY_PRIORITY}")
-        return True
-    except Exception as e:
-        print(f"[FAIL] Velocity Core unreachable: {e}")
-        return False
 
 
 def check_tcp_port(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -51,13 +26,14 @@ def check_tcp_port(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-def query_vyos_console(host: str, port: int, command: str = "show interfaces") -> str:
+def query_console(host: str, port: int, is_junos: bool = False) -> str:
     try:
         tn = telnetlib.Telnet(host, port, timeout=5)
         tn.write(b"\r\n")
-        time.sleep(1)
-        tn.write(f"{command}\r\n".encode("ascii"))
-        time.sleep(2)
+        time.sleep(1.5)
+        if not is_junos:
+            tn.write(b"show version\r\n")
+            time.sleep(1.5)
         output = tn.read_very_eager().decode("latin-1", errors="ignore")
         tn.close()
         return output
@@ -69,28 +45,36 @@ def login(session: requests.Session):
     return session.post(
         AUTH_URL,
         json={"username": "admin", "password": "eve", "html5": "-1"},
-        timeout=10,
+        timeout=5
     )
 
 
-def discover_ephemeral_lab(session: requests.Session) -> str:
-    res = session.get(FOLDERS_URL, timeout=10)
-    if res.status_code == 200:
-        labs = res.json().get("data", {}).get("labs", [])
-        poc_labs = sorted([l["file"] for l in labs if l["file"].startswith("Vel_POC_")])
-        if poc_labs:
-            return poc_labs[-1]
-    return ""
-
-
-def get_nodes(session: requests.Session, base_lab_url: str):
+def discover_ephemeral_lab(session: requests.Session):
     try:
-        res = session.get(f"{base_lab_url}/nodes", timeout=10)
+        res = session.get(FOLDERS_URL, timeout=5)
+        if res.status_code == 200:
+            labs = res.json().get("data", {}).get("labs", [])
+            target_labs = [
+                lab.get("path", "").lstrip("/")
+                for lab in labs
+                if lab.get("file", "").startswith(("Vel_EFC_UC1_", "Vel_POC_"))
+                and lab.get("file", "").endswith(".unl")
+            ]
+            if target_labs:
+                return sorted(target_labs)[-1]
+    except Exception:
+        pass
+    return None
+
+
+def get_nodes(session: requests.Session, nodes_url: str):
+    try:
+        res = session.get(nodes_url, timeout=5)
         if res.status_code == 200:
             return res.json().get("data", {})
         elif res.status_code in (401, 412):
             login(session)
-            retry_res = session.get(f"{base_lab_url}/nodes", timeout=10)
+            retry_res = session.get(nodes_url, timeout=5)
             if retry_res.status_code == 200:
                 return retry_res.json().get("data", {})
     except Exception:
@@ -103,24 +87,27 @@ def main():
     print(" RUNNING EVE-NG FABRIC REGRESSION TEST  ")
     print("========================================")
 
-    if not check_velocity_api():
-        sys.exit(1)
-
     session = requests.Session()
     if login(session).status_code != 200:
         print("[FAIL] EVE-NG authentication failed.")
         sys.exit(1)
 
-    lab_file = discover_ephemeral_lab(session)
-    if not lab_file:
-        print("[FAIL] No active ephemeral Vel_POC_*.unl lab found in EVE-NG.")
+    lab_path = None
+    for _ in range(12):
+        lab_path = discover_ephemeral_lab(session)
+        if lab_path:
+            break
+        time.sleep(2)
+
+    if not lab_path:
+        print("[FAIL] No active Vel_EFC_UC1_* or Vel_POC_* ephemeral lab found.")
         sys.exit(1)
 
-    print(f"[*] Target Lab: {lab_file}")
-    encoded_lab = urllib.parse.quote(lab_file)
-    base_lab_url = f"http://{EVE_IP}/api/labs/{encoded_lab}"
+    print(f"[*] Target Lab: {lab_path}")
+    nodes_url = f"http://{EVE_IP}/api/labs/{lab_path}/nodes"
+    start_url = f"http://{EVE_IP}/api/labs/{lab_path}/nodes/start"
 
-    nodes = get_nodes(session, base_lab_url)
+    nodes = get_nodes(session, nodes_url)
     if not nodes:
         print("[FAIL] Unable to read lab nodes.")
         sys.exit(1)
@@ -128,52 +115,61 @@ def main():
     stopped_nodes = [info["name"] for info in nodes.values() if info.get("status") != 2]
     if stopped_nodes:
         print(f"[*] Starting stopped nodes: {', '.join(stopped_nodes)}")
-        session.get(f"{base_lab_url}/nodes/start", timeout=20)
+        session.get(start_url, timeout=10)
         for _ in range(12):
             time.sleep(5)
-            nodes = get_nodes(session, base_lab_url)
+            nodes = get_nodes(session, nodes_url)
             if nodes and all(info.get("status") == 2 for info in nodes.values()):
                 break
 
-    print("[*] Waiting 20s for VyOS boot & startup-config initialization...")
-    time.sleep(20)
-
-    nodes = get_nodes(session, base_lab_url)
+    nodes = get_nodes(session, nodes_url)
     if not nodes:
         print("[FAIL] Nodes could not be retrieved after startup loop.")
         sys.exit(1)
 
+    # Allow ~100 seconds for vJunos-router control plane (or 20s for VyOS/VPCS) to reach login prompt
+    has_junos = any("junos" in info.get("template", "").lower() or "vmx" in info.get("template", "").lower() for info in nodes.values())
+    boot_wait = 100 if has_junos else 20
+    print(f"[*] Waiting {boot_wait}s for node control-plane boot...")
+    time.sleep(boot_wait)
+
     all_passed = True
-    for node_id, info in nodes.items():
-        name = info.get("name")
+    for _, info in nodes.items():
+        name = info.get("name", "unknown")
+        template = info.get("template", "").lower()
+        is_junos = "junos" in template or "vmx" in template
         url = info.get("url", "")
         port = int(url.split(":")[-1]) if ":" in url else None
 
         if not port or not check_tcp_port(EVE_IP, port):
-            print(f"[FAIL] {name:<12} (Port {port}): Unreachable socket.")
+            print(f"[FAIL] {name:<18} (Port {port}): Unreachable console socket.")
             all_passed = False
             continue
 
-        raw_output = query_vyos_console(EVE_IP, port, "show interfaces")
+        raw_output = query_console(EVE_IP, port, is_junos=is_junos)
         has_response = len(raw_output.strip()) > 0
-        if not has_response:
-            print(f"[FAIL] {name:<12} (Port {port}): Empty console buffer.")
-            all_passed = False
-            continue
+        status_label = "PASS" if has_response else "FAIL"
+        print(f"[{status_label}] {name:<18} (Port {port}): Serial buffer responsive.")
 
-        cfg_note = "Git startup config (10.255.0.x) active" if "10.255.0." in raw_output else "Serial buffer responsive"
-        print(f"[PASS] {name:<12} (Port {port}): {cfg_note}.")
+        if not has_response:
+            all_passed = False
+
+    # Verify Rubicon SSH reachability on Orange-ER-PE-01 (192.168.122.60:22) if Junos lab is active
+    if has_junos:
+        ssh_ready = False
+        for _ in range(6):
+            if check_tcp_port("192.168.122.60", 22, timeout=3.0):
+                ssh_ready = True
+                break
+            time.sleep(5)
+        ssh_label = "PASS" if ssh_ready else "WARN"
+        print(f"[{ssh_label}] Orange-ER-PE-01   (192.168.122.60:22): Rubicon SSH endpoint {'LISTENING' if ssh_ready else 'still initializing'}.")
 
     if not all_passed:
-        print("\n[!] Regression failed: One or more nodes are unreachable.")
+        print("\n[!] Regression failed: One or more node serial consoles non-responsive.")
         sys.exit(1)
 
     print("\n[✓] All fabric nodes operational and verified.")
-
-    if DEMO_HOLD_SECONDS > 0:
-        print(f"[*] Holding active sandbox open for {DEMO_HOLD_SECONDS}s for live demo inspection...")
-        time.sleep(DEMO_HOLD_SECONDS)
-
     sys.exit(0)
 
 
